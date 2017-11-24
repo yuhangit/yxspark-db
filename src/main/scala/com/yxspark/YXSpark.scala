@@ -12,12 +12,13 @@ import org.apache.spark.sql.functions.{concat, lit, split}
 object YXSpark {
   val sdf: SimpleDateFormat = new SimpleDateFormat("yyyyMMdd")
   val hdfspath: String = "hdfs://ns1/user/" + System.getProperty("user.name") + "/private/"
-  val hdfsconfpath: String = "hdfs://ns1/user/" + System.getProperty("user.name") + "/private/all/config/"
+  val hdfsconfpath: String = hdfspath + "all/config/"
   val today: String = sdf.format(new Date())
 
   val spark: SparkSession = SparkSession.builder().appName("YXSpark").getOrCreate()
   val sc: SparkContext = spark.sparkContext
   import spark.sqlContext.implicits._
+  val mode: String = sc.getConf.get("spark.submit.deployMode")
 
   def escape(raw: String): String = {
     import scala.reflect.runtime.universe._
@@ -34,13 +35,21 @@ object YXSpark {
     val lclient = client.toLowerCase
     val configfile = lclient + ".config"
 
-    //    val sources = scala.io.Source.fromFile(configfile).getLines
-    //      .map(l => l.split(" +").toList)
-    //      .filter(l => l.head.toLowerCase() == "source")
-    //      .toList
-    val sources = sc.textFile(hdfsconfpath + configfile).map(l=>l.split(" +").toList).collect()
-      .filter(l => l.head.toLowerCase() == "source").toList
+    val configpath = if (mode == "cluster") hdfsconfpath
+    else if (mode == "client")  ""
 
+    val sources :List[List[String]] =
+      if (mode == "cluster") {
+        sc.textFile(configpath + configfile).map(l=>l.split(" +").toList).collect()
+          .filter(l => l.head.toLowerCase() == "source").toList
+      } else if (mode == "client") {
+        scala.io.Source.fromFile(configpath + configfile).getLines
+          .map(l => l.split(" +").toList)
+          .filter(l => l.head.toLowerCase() == "source")
+          .toList
+      } else {
+        List[List[String]]()
+      }
     sources
   }
 
@@ -55,14 +64,23 @@ object YXSpark {
     val lclient = client.toLowerCase
     val configfile = lclient + ".config"
 
-    //    val configm = scala.io.Source.fromFile(configfile).getLines.map({l =>
-    //      val t = l.split(" +")
-    //      (t(0).toLowerCase(), t(1))
-    //    }).toMap
-    val configm = sc.textFile(hdfsconfpath + configfile).map({l=>
-      val t = l.split(" +")
-      (t(0).toLowerCase(), t(1))
-    }).collect().toMap
+    val configpath = if (mode == "cluster") hdfsconfpath
+      else if (mode == "client")  ""
+
+    val configm :Map[String, String] =
+      if (mode == "cluster") {
+        sc.textFile(configpath + configfile).map({ l =>
+          val t = l.split(" +")
+          (t(0).toLowerCase(), t(1))
+        }).collect().toMap
+      } else if (mode == "client") {
+        scala.io.Source.fromFile(configpath + configfile).getLines.map({ l =>
+          val t = l.split(" +")
+          (t(0).toLowerCase(), t(1))
+        }).toMap
+      } else {
+        Map[String, String]()
+      }
 
     val normalrun = if (sdate.contains(",") || sdate.contains("*")) false else true
 
@@ -90,8 +108,8 @@ object YXSpark {
       ("kv_tbl", hdfspath + lclient + dir + "kv_tbl"),
       ("kv_enc_tbl", hdfspath + lclient + dir + "kv_enc_tbl"),
       ("history_tbl", hdfspath + configm("history_tbl")),
-      ("appname_file", hdfsconfpath + configm("appname_file")),
-      ("tag_file", hdfsconfpath + configm("tag_file")),
+      ("appname_file", configpath + configm("appname_file")),
+      ("tag_file", configpath + configm("tag_file")),
       ("output_dlm", outputdlm),
       ("tag_dlm", tagdlm)
     )
@@ -100,29 +118,25 @@ object YXSpark {
   }
 
   def getfiles(filename: String) : List[String] = {
+      val fs = FileSystem.get(new java.net.URI(hdfsconfpath),new Configuration())
+      val files = fs.listStatus(new Path(hdfsconfpath))
+      val ds = fs.getFileStatus(new Path(hdfsconfpath))
+      if(ds.isDirectory()){
+        files.filter(n=>n.isFile && n.getPath.toString.contains(filename)).map({n=>n.getPath.toString}).toList
+      }else{
+        List[String]()
+      }
 
-    //    val d = new File(".")
-    //    if (d.exists && d.isDirectory) {
-    //      d.listFiles.filter(n => n.isFile && n.getName.contains(filename))
-    //        .map(n => n.getName).toList
-    //    } else {
-    //      List[String]()
-    //    }
-    val fs = FileSystem.get(new java.net.URI("/user/u_tel_hlwb_xgq/private/all/config/"),new Configuration())
-    val files = fs.listStatus(new Path("/user/u_tel_hlwb_xgq/private/all/config/"))
-    val ds = fs.getFileStatus(new Path("/user/u_tel_hlwb_xgq/private/all/config/"))
-    if(ds.isDirectory()){
-      files.filter(n=>n.isFile && n.getPath.toString.contains(filename)).map({n=>n.getPath.toString}).toList
-    }else{
-      List[String]()
-    }
+      //    val d = new File(".")
+      //    if (d.exists && d.isDirectory) {
+      //      d.listFiles.filter(n => n.isFile && n.getName.contains(filename))
+      //        .map(n => n.getName).toList
+      //    } else {
+      //      List[String]()
+      //    }
   }
 
-  def stg_s0(sdate: String): Unit = {
-    val client = "all"
-    val varsmap = getvars(client, sdate)
-    val sources = getsources(client)
-
+  def stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String): Unit = {
     println("Running stg_s0")
 
     sources.foreach({l =>
@@ -149,10 +163,7 @@ object YXSpark {
     })
   }
 
-  def stg_s1(client: String, sdate: String, source: String = "") {
-    val varsmap = getvars(client, sdate)
-    val sources = getsources(client)
-
+  def stg_s1(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, source: String = "") {
     println("Running stg_s1")
 
     sources.foreach({l =>
@@ -171,10 +182,7 @@ object YXSpark {
     })
   }
 
-  def stg_s2(client: String, sdate: String) {
-    val varsmap = getvars(client, sdate)
-    val sources = getsources(client)
-
+  def stg_s2(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String) {
     println("Running stg_s2")
 
     val data = sources.map({l =>
@@ -211,23 +219,38 @@ object YXSpark {
     showcounts(varsmap("stg_s2"))
   }
 
-  def stg_s3(client: String, sdate: String, af: Int) {
-    import sys.process._
-
-    val varsmap = getvars(client, sdate)
-
+  def stg_s3(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, af: Int) {
     println("Running stg_s3")
 
-    val ht = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1"
-    val shell = if (varsmap("output_dlm") == "\t") "spark-submit-hlwbbigdata-tab.sh" else ""
+    val ht :String = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1" else ""
 
-    val cmd = "./" + shell + " " + varsmap("stg_s2") + " " + ht + " " + af
-    //val cmd = "hadoop fs -cat "+ hdfsconfpath + shell + " | exec sh -s " + varsmap("stg_s2") + " " + ht + " " + af
+    if (mode == "cluster") {
+      try {
+        import hlwbbigdata.phone
+        phone.main(Array(varsmap("stg_s2"), ht, af.toString, "\\t"))
+      } catch {
+        case e: Exception => println("Exception in match: " + e)
+      }
 
-    println("Running" + cmd)
+    } else if (mode == "client") {
+      import sys.process._
 
-    val ret = cmd.!
+      val shell = if (varsmap("output_dlm") == "\t") "spark-submit-hlwbbigdata-tab.sh" else ""
 
+      val cmd = "./" + shell + " " + varsmap("stg_s2") + " " + ht + " " + af
+
+      println("Running" + cmd)
+      val ret = cmd.!
+
+      println("Process finished with exit code " + ret)
+
+      if (ret != 0) {
+        println("Shell job returned error code, job aborted")
+        System.exit(1)
+      }
+    }
+
+    showcounts(ht.toString)
 
     if (af == 1) {
       val stg_acc_s3 = sc.textFile(varsmap("stg_acc_s3")).toDF
@@ -247,20 +270,12 @@ object YXSpark {
 
       stg_fuz_s3.coalesce(10).write.format("com.databricks.spark.csv")
         .option("delimiter", varsmap("output_dlm")).save(varsmap("stg_fuz_s3"))
+
+      showcounts(varsmap("stg_fuz_s3"))
     }
-
-    println("Process finished with exit code " + ret)
-
-    if (ret != 0) {
-      println("Shell job returned error code, job aborted")
-      System.exit(1)
-    }
-
-    showcounts(ht.toString)
   }
 
-  def final_tbl(client: String, sdate: String) {
-    val varsmap = getvars(client, sdate)
+  def final_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String) {
     val ltagdlm = varsmap("tag_dlm")
 
     println("Running final_tbl")
@@ -298,8 +313,7 @@ object YXSpark {
     showcounts(varsmap("final_tbl"))
   }
 
-  def kv_tbl(client: String, sdate: String, tag: String, batch: Int) {
-    val varsmap = getvars(client, sdate)
+  def kv_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag: String, batch: Int) {
     val ldlm = varsmap("output_dlm")
     val ltagdlm = varsmap("tag_dlm")
 
@@ -337,10 +351,7 @@ object YXSpark {
     })
   }
 
-  def kv_enc_tbl(client: String, sdate: String, pfx: String, source: String = "_s1") {
-    val varsmap = getvars(client, sdate)
-    val sources = getsources(client)
-
+  def kv_enc_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, pfx: String, source: String = "_s1") {
     println("Running kv_enc_tbl")
 
     val data = sources.filter(l => tblexists(varsmap(l(1) + source))).map({l =>
@@ -394,40 +405,45 @@ object YXSpark {
     df.show
   }
 
-  def run_all(client: String, sdate: String, tag:String, batch: Int, pfx: String) {
-    stg_s1(client, sdate)
-    stg_s2(client, sdate)
-    stg_s3(client, sdate, 0)
-    stg_s3(client, sdate, 1)
-    final_tbl(client, sdate)
-    kv_tbl(client, sdate, tag, batch)
-    kv_enc_tbl(client, sdate, pfx, "_s0")
+  def run_all(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag:String, batch: Int) {
+    stg_s1(varsmap, sources, client, sdate)
+    stg_s2(varsmap, sources, client, sdate)
+    stg_s3(varsmap, sources, client, sdate, 0)
+    stg_s3(varsmap, sources, client, sdate, 1)
+    final_tbl(varsmap, sources, client, sdate)
+    kv_tbl(varsmap, sources, client, sdate, tag, batch)
   }
 
-  def run_all_with_stg_s0(client: String, sdate: String, tag:String, batch: Int, pfx: String) {
-    stg_s1(client, sdate, "_s0")
-    stg_s2(client, sdate)
-    stg_s3(client, sdate, 0)
-    stg_s3(client, sdate, 1)
-    final_tbl(client, sdate)
-    kv_tbl(client, sdate, tag, batch)
-    kv_enc_tbl(client, sdate, pfx)
+  def run_all_with_stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag:String, batch: Int) {
+    stg_s1(varsmap, sources, client, sdate, "_s0")
+    stg_s2(varsmap, sources, client, sdate)
+    stg_s3(varsmap, sources, client, sdate, 0)
+    stg_s3(varsmap, sources, client, sdate, 1)
+    final_tbl(varsmap, sources, client, sdate)
+    kv_tbl(varsmap, sources, client, sdate, tag, batch)
   }
 
   def main(args: Array[String]) {
-    args(0) match {
-      case "stg_s0" => stg_s0(args(1))
-      case "stg_s1" => stg_s1(args(1), args(2))
-      case "stg_s1_with_stg_s0" => stg_s1(args(1), args(2), "_s0")
-      case "stg_s2" => stg_s2(args(1), args(2))
-      case "stg_s3_acc" => stg_s3(args(1), args(2), 0)
-      case "stg_s3_fuz" => stg_s3(args(1), args(2), 1)
-      case "final_tbl" => final_tbl(args(1), args(2))
-      case "kv_tbl" => kv_tbl(args(1), args(2), args(3), args(4).toInt)
-      case "kv_enc_tbl" => kv_enc_tbl(args(1), args(2), args(3))
-      case "kv_enc_tbl_with_stg_s0" => kv_enc_tbl("all", args(1), args(2), "_s0")
-      case "run_all" => run_all(args(1), args(2), args(3), args(4).toInt, args(5))
-      case "run_all_with_stg_s0" => run_all_with_stg_s0(args(1), args(2), args(3), args(4).toInt, args(5))
+    val prog = args(0)
+    val client = if (prog == "stg_s0" || prog == "kv_enc_tbl_with_stg_s0") "all" else args(1)
+    val sdate = args(2)
+
+    val varsmap = getvars(client, sdate)
+    val sources = getsources(client)
+
+    prog match {
+      case "stg_s0" => stg_s0(varsmap, sources, client, sdate)
+      case "stg_s1" => stg_s1(varsmap, sources, client, sdate)
+      case "stg_s1_with_stg_s0" => stg_s1(varsmap, sources, client, sdate, "_s0")
+      case "stg_s2" => stg_s2(varsmap, sources, client, sdate)
+      case "stg_s3_acc" => stg_s3(varsmap, sources, client, sdate, 0)
+      case "stg_s3_fuz" => stg_s3(varsmap, sources, client, sdate, 1)
+      case "final_tbl" => final_tbl(varsmap, sources, client, sdate)
+      case "kv_tbl" => kv_tbl(varsmap, sources, client, sdate, args(3), args(4).toInt)
+      case "kv_enc_tbl" => kv_enc_tbl(varsmap, sources, client, sdate, args(3))
+      case "kv_enc_tbl_with_stg_s0" => kv_enc_tbl(varsmap, sources, client, sdate, args(3), "_s0")
+      case "run_all" => run_all(varsmap, sources, client, sdate, args(3), args(4).toInt)
+      case "run_all_with_stg_s0" => run_all_with_stg_s0(varsmap, sources, client, sdate, args(3), args(4).toInt)
     }
   }
 }
