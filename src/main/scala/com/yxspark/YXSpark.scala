@@ -233,15 +233,14 @@ object YXSpark {
       val stg_acc_s3 = sc.textFile(varsmap("stg_acc_s3")).toDF
         .withColumn("_tmp", split($"value", varsmap("output_dlm")))
         .select(
-          $"_tmp".getItem(0).as("mobile"),
-          $"_tmp".getItem(2).as("pattern")
+          $"_tmp".getItem(0).as("mobile")
         ).drop($"_tmp").dropDuplicates().toDF()
 
       val stg_fuz_s3_s1 = sc.textFile(varsmap("stg_fuz_s3") + "_s1").toDF
         .withColumn("_tmp", split($"value", varsmap("output_dlm")))
         .select(
           $"_tmp".getItem(0).as("mobile"),
-          $"_tmp".getItem(2).as("pattern")
+          $"_tmp".getItem(1).as("pattern")
         ).drop($"_tmp").dropDuplicates().toDF()
 
       val stg_fuz_s3 = stg_fuz_s3_s1.join(stg_acc_s3, Seq("mobile"), "leftanti")
