@@ -222,7 +222,7 @@ object YXSpark {
     val shell = if (varsmap("output_dlm") == "\t") "spark-submit-hlwbbigdata-tab.sh" else ""
 
     val cmd = "./" + shell + " " + varsmap("stg_s2") + " " + ht + " " + af
-    //  val cmd = "hadoop fs -cat "+ hdfsconfpath + shell + " | exec sh -s " + varsmap("stg_s2") + " " + ht + " " + af
+    //val cmd = "hadoop fs -cat "+ hdfsconfpath + shell + " | exec sh -s " + varsmap("stg_s2") + " " + ht + " " + af
 
     println("Running" + cmd)
 
