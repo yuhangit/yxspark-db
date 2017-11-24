@@ -10,4 +10,3 @@ libraryDependencies ++= Seq(
 )
 
 unmanagedBase := baseDirectory.value / "libs"
-        
