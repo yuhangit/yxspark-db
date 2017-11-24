@@ -326,7 +326,7 @@ object YXSpark {
       val df3 = df2.filter("tag_prefix = '" + r._1.get(0).toString + "'")
 
       val tbl = df3.rdd.zipWithIndex().map({x =>
-        val pattern = x._1.get(1).toString.replace(ltagdlm, " ").split(" +").toArray
+        val pattern = x._1.get(1).toString.replace(ltagdlm, " ").split(" +")
         (key + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + ldlm + x._1.get(0).toString)
       }).union(sc.parallelize(Seq((key + "_total", r._1.get(1).toString))))
         .toDF()
