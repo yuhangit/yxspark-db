@@ -223,15 +223,20 @@ object YXSpark {
     println("Running stg_s3")
 
     val ht :String = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1" else ""
+    val ldlm = varsmap("output_dlm")
 
     if (mode == "cluster") {
-      try {
-        import hlwbbigdata.phone
-        phone.main(Array(varsmap("stg_s2"), ht, af.toString, "\\t"))
-      } catch {
-        case e: Exception => println("Exception in match: " + e)
-      }
+      import hlwbbigdata.phone
 
+      val inputtbl = sc.textFile(varsmap("stg_s2")).map({r =>
+        val arr = r.split(ldlm)
+        (arr(0), arr(1), arr(2))
+      })
+
+      val outputtbl = phone.phone_match(spark, inputtbl, af.toString)
+
+      outputtbl.coalesce(10).write.format("com.databricks.spark.csv")
+        .option("delimiter", ldlm).save(ht)
     } else if (mode == "client") {
       import sys.process._
 
@@ -254,13 +259,13 @@ object YXSpark {
 
     if (af == 1) {
       val stg_acc_s3 = sc.textFile(varsmap("stg_acc_s3")).toDF
-        .withColumn("_tmp", split($"value", varsmap("output_dlm")))
+        .withColumn("_tmp", split($"value", ldlm))
         .select(
           $"_tmp".getItem(0).as("mobile")
         ).drop($"_tmp").dropDuplicates().toDF()
 
-      val stg_fuz_s3_s1 = sc.textFile(varsmap("stg_fuz_s3") + "_s1").toDF
-        .withColumn("_tmp", split($"value", varsmap("output_dlm")))
+      val stg_fuz_s3_s1 = sc.textFile(ht).toDF
+        .withColumn("_tmp", split($"value", ldlm))
         .select(
           $"_tmp".getItem(0).as("mobile"),
           $"_tmp".getItem(1).as("pattern")
@@ -269,7 +274,7 @@ object YXSpark {
       val stg_fuz_s3 = stg_fuz_s3_s1.join(stg_acc_s3, Seq("mobile"), "leftanti")
 
       stg_fuz_s3.coalesce(10).write.format("com.databricks.spark.csv")
-        .option("delimiter", varsmap("output_dlm")).save(varsmap("stg_fuz_s3"))
+        .option("delimiter", ldlm).save(varsmap("stg_fuz_s3"))
 
       showcounts(varsmap("stg_fuz_s3"))
     }

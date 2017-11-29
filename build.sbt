@@ -9,4 +9,5 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-sql" % "2.2.0"
 )
 
+
 unmanagedBase := baseDirectory.value / "libs"
