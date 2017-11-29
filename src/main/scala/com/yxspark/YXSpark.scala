@@ -353,6 +353,7 @@ object YXSpark {
       println("Tag " + r._1.get(0) + " has " + r._1.get(1) + " rows")
 
       val key_new = r._1.get(0).toString.replace(ltagdlm, " ").split(" +")
+
       val key_1 = key_new.slice(0,2).mkString("_") + "_" + "%02d".format(r._2 + batch) + "_" + today
 
       val key = r._1.get(0).toString + "_" + "%02d".format(r._2 + batch) + "_" + today
