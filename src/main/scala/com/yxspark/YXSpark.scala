@@ -291,7 +291,11 @@ object YXSpark {
         .drop($"_stmp")
     })
 
-    val history_tbl = sc.textFile(varsmap("history_tbl")).toDF("id")
+    val history_tbl = sc.textFile(varsmap("history_tbl")).toDF
+      .withColumn("_tmp", split($"value", varsmap("output_dlm")))
+      .select(
+        $"_tmp".getItem(0).as("id")
+      ).drop($"_tmp")
     //    val tagl = scala.io.Source.fromFile(varsmap("tag_file")).getLines.map(l => l.split(" +")).toList
     val tagl = sc.textFile(varsmap("tag_file")).map(l=>l.split(" +")).collect().toList
     //al.foreach(l => println(l.mkString(",")))
@@ -311,6 +315,15 @@ object YXSpark {
       .option("delimiter", varsmap("output_dlm")).save(varsmap("final_tbl"))
 
     showcounts(varsmap("final_tbl"))
+  }
+
+  def history_new(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String) {
+    val ldlm = varsmap("output_dlm")
+
+    println("Running kv_tbl")
+
+    val df = sc.textFile(varsmap("final_tbl")).toDF
+      .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter", varsmap("output_dlm")).save(varsmap("history_tbl") + "/final_tbl_" + sdate)
   }
 
   def kv_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag: String, batch: Int) {
@@ -334,13 +347,16 @@ object YXSpark {
     counts.zipWithIndex.foreach({r =>
       println("Tag " + r._1.get(0) + " has " + r._1.get(1) + " rows")
 
+      val key_new = r._1.get(0).toString.replace(ltagdlm, " ").split(" +")
+      val key_1 = key_new.slice(0,2).mkString("_") + "_" + "%02d".format(r._2 + batch) + "_" + today
+
       val key = r._1.get(0).toString + "_" + "%02d".format(r._2 + batch) + "_" + today
 
       val df3 = df2.filter("tag_prefix = '" + r._1.get(0).toString + "'")
 
       val tbl = df3.rdd.zipWithIndex().map({x =>
         val pattern = x._1.get(1).toString.replace(ltagdlm, " ").split(" +")
-        (key + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + ldlm + x._1.get(0).toString)
+        (key_1 + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + ldlm + x._1.get(0).toString)
       }).union(sc.parallelize(Seq((key + "_total", r._1.get(1).toString))))
         .toDF()
 
