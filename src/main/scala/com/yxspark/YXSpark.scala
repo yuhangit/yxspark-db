@@ -352,17 +352,14 @@ object YXSpark {
     counts.zipWithIndex.foreach({r =>
       println("Tag " + r._1.get(0) + " has " + r._1.get(1) + " rows")
 
-      val key_new = r._1.get(0).toString.replace(ltagdlm, " ").split(" +")
-
-      val key_1 = key_new.slice(0,2).mkString("_") + "_" + "%02d".format(r._2 + batch) + "_" + today
-
       val key = r._1.get(0).toString + "_" + "%02d".format(r._2 + batch) + "_" + today
 
       val df3 = df2.filter("tag_prefix = '" + r._1.get(0).toString + "'")
 
       val tbl = df3.rdd.zipWithIndex().map({x =>
         val pattern = x._1.get(1).toString.replace(ltagdlm, " ").split(" +")
-        (key_1 + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + ldlm + x._1.get(0).toString)
+        val injval = if (pattern.size == 3) pattern(2) else ""
+        (key + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + "_" + injval + ldlm + x._1.get(0).toString)
       }).union(sc.parallelize(Seq((key + "_total", r._1.get(1).toString))))
         .toDF()
 
