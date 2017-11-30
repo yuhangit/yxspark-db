@@ -311,8 +311,9 @@ object YXSpark {
         val tag = tagl.filter({x =>
           val tags = x(0).replace(ltagdlm, " ").split(" +").toList
           tags.forall(r(1).toString.contains(_))
-        }).map(x => x(1)).headOption.getOrElse("")
-        (r(0).toString, r(1).toString, tag)
+        }).map(x => (x(1), if (x.length == 3) x(2) else ""))
+          .headOption.getOrElse(("", ""))
+        (r(0).toString, r(1).toString, tag._1, tag._2)
       })
       .filter(x => x._3 != "").dropDuplicates
 
@@ -327,8 +328,11 @@ object YXSpark {
 
     println("Running kv_tbl")
 
+
+
     val df = sc.textFile(varsmap("final_tbl")).toDF
-      .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter", varsmap("output_dlm")).save(varsmap("history_tbl") + "/final_tbl_" + sdate)
+      .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter", varsmap("output_dlm"))
+      .save(varsmap("history_tbl") + "/final_tbl_" + sdate)
   }
 
   def kv_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag: String, batch: Int) {
@@ -342,7 +346,8 @@ object YXSpark {
       .select(
         $"_tmp".getItem(0).as("mobile"),
         $"_tmp".getItem(1).as("pattern"),
-        $"_tmp".getItem(2).as("tag_prefix")
+        $"_tmp".getItem(2).as("tag_prefix"),
+        $"_tmp".getItem(3).as("inj_value")
       ).drop($"_tmp").dropDuplicates().toDF()
 
     val df2 = if (tag == "all") df else df.filter("tag_prefix = '" + tag + "'")
@@ -358,8 +363,8 @@ object YXSpark {
 
       val tbl = df3.rdd.zipWithIndex().map({x =>
         val pattern = x._1.get(1).toString.replace(ltagdlm, " ").split(" +")
-        val injval = if (pattern.size == 3) pattern(2) else ""
-        (key + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + "_" + injval + ldlm + x._1.get(0).toString)
+        val injval = if (x._1.get(3) != "") ":" + x._1.get(3) else ""
+        (key + "_" + x._2, "ad" + ldlm + pattern(1) + ":" + key + injval + ldlm + x._1.get(0).toString)
       }).union(sc.parallelize(Seq((key + "_total", r._1.get(1).toString))))
         .toDF()
 
