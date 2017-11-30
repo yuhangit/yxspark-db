@@ -90,6 +90,7 @@ object YXSpark {
     val outputdlm = if (configm.contains("output_dlm")) configm("output_dlm") else "\t"
     val tagdlm = if (configm.contains("tag_dlm")) configm("tag_dlm") else "$$$"
     val hdfspublic = "hdfs://ns1/user/gdpi/public/"
+    val history_dir = if (configm("history_dir").endsWith("/")) configm("history_dir") else configm("history_dir") + "/"
 
     val varsmap = Map(
       ("adcookie", hdfspublic + "sada_gdpi_adcookie/" + sdate + "/*/*.gz"),
@@ -107,7 +108,8 @@ object YXSpark {
       ("final_tbl", hdfspath + lclient + dir + "final_tbl"),
       ("kv_tbl", hdfspath + lclient + dir + "kv_tbl"),
       ("kv_enc_tbl", hdfspath + lclient + dir + "kv_enc_tbl"),
-      ("history_tbl", hdfspath + configm("history_tbl")),
+      ("history_dir", hdfspath + history_dir),
+      ("history_tbl", hdfspath + history_dir + "*"),
       ("appname_file", configpath + configm("appname_file")),
       ("tag_file", configpath + configm("tag_file")),
       ("output_dlm", outputdlm),
@@ -323,16 +325,24 @@ object YXSpark {
     showcounts(varsmap("final_tbl"))
   }
 
-  def history_new(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String) {
+  def history_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag: String) {
     val ldlm = varsmap("output_dlm")
 
-    println("Running kv_tbl")
+    println("Running history_tbl")
 
+    val ht = if (tag == "all") varsmap("kv_tbl") + "*/*" else varsmap("kv_tbl") + "_" + tag
 
+    val df = sc.textFile(ht).map({r =>
+      val strarr = r.split(ldlm)
+      if (strarr.length == 4) strarr(3).replace("\"", "") else ""
+    }).filter(x => x != "").toDF().dropDuplicates()
 
-    val df = sc.textFile(varsmap("final_tbl")).toDF
-      .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter", varsmap("output_dlm"))
-      .save(varsmap("history_tbl") + "/final_tbl_" + sdate)
+    val tblp = varsmap("history_dir") + "history_tbl_" + tag + "_" + sdate
+
+    df.coalesce(1).write.format("com.databricks.spark.csv").option("delimiter", varsmap("output_dlm"))
+      .save(tblp)
+
+    showcounts(tblp)
   }
 
   def kv_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag: String, batch: Int) {
@@ -464,6 +474,7 @@ object YXSpark {
       case "stg_s3_fuz" => stg_s3(varsmap, sources, client, sdate, 1)
       case "final_tbl" => final_tbl(varsmap, sources, client, sdate)
       case "kv_tbl" => kv_tbl(varsmap, sources, client, sdate, args(3), args(4).toInt)
+      case "history_tbl" => history_tbl(varsmap, sources, client, sdate, args(3))
       case "kv_enc_tbl" => kv_enc_tbl(varsmap, sources, client, sdate, args(3))
       case "kv_enc_tbl_with_stg_s0" => kv_enc_tbl(varsmap, sources, client, sdate, args(3), "_s0")
       case "run_all" => run_all(varsmap, sources, client, sdate, args(3), args(4).toInt)
