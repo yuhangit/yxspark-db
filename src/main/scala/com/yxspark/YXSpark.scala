@@ -5,9 +5,16 @@ import java.util.Date
 
 import org.apache.hadoop.conf._
 import org.apache.hadoop.fs._
+import org.apache.spark.sql.functions._
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.{concat, lit, split}
+import java.io.FileNotFoundException
+
+import org.apache.hadoop.fs.{FileSystem, Path}
+import java.io.File
+
+import com.sun.xml.internal.bind.v2.runtime.unmarshaller.TagName
 
 object YXSpark {
   val sdf: SimpleDateFormat = new SimpleDateFormat("yyyyMMdd")
@@ -17,6 +24,9 @@ object YXSpark {
 
   val spark: SparkSession = SparkSession.builder().appName("YXSpark").getOrCreate()
   val sc: SparkContext = spark.sparkContext
+  val fs = FileSystem.get(sc.hadoopConfiguration)
+
+
   import spark.sqlContext.implicits._
   val mode: String = sc.getConf.get("spark.submit.deployMode")
 
@@ -462,6 +472,10 @@ object YXSpark {
     val client = if (prog == "stg_s0" || prog == "kv_enc_tbl_with_stg_s0") "all" else args(1)
     val sdate = args(2)
 
+    // judege if cdr or not
+    val prjName = if (prog == "cdr") args(1) else ""
+    val tag = if (prog == "cdr") args(2) else ""
+
     val varsmap = getvars(client, sdate)
     val sources = getsources(client)
 
@@ -479,7 +493,148 @@ object YXSpark {
       case "kv_enc_tbl_with_stg_s0" => kv_enc_tbl(varsmap, sources, client, sdate, args(3), "_s0")
       case "run_all" => run_all(varsmap, sources, client, sdate, args(3), args(4).toInt)
       case "run_all_with_stg_s0" => run_all_with_stg_s0(varsmap, sources, client, sdate, args(3), args(4).toInt)
+      case "cdr" => cdr(prjName, tag)
     }
+  }
+
+
+
+
+  private def inOrOut(prjName:String,batchId:String):String={
+    val map = (prjName,batchId) match {
+      case ("daoxila","22") => "call_in"
+      case ("daoxila","23") => "call_out"
+      case("qijia","ZT1") => "call_in"
+      case ("qijia","ZT2") => "call_out"
+    }
+    return map
+  }
+
+  private def deleteFile(filePath:String): Unit ={
+    if (fs.exists(new Path(filePath))){
+      println(s"hadoop file path ${filePath} already exists, deleting...")
+      fs.delete(new Path(filePath),true)
+    }else if ( new File(filePath).exists()){
+      println(s"local file path ${filePath} already exists, deleting...")
+      new File(filePath).delete()
+    }
+  }
+
+  def fromLocalToHadoop(srcPath:String, destPath:String):String={
+
+    println(s"source local directory: ${srcPath}")
+    println(s"destination hadoop directory: ${destPath}")
+
+    if (!new File(srcPath).exists()){
+      println(s"input local file path: ${srcPath} is not exists, please chen again")
+      throw new FileNotFoundException()
+    }
+
+
+    val inputFile = new Path(srcPath)
+    val outputFile = new Path(destPath)
+
+
+    fs.copyFromLocalFile(false, true, inputFile, outputFile)
+
+    return destPath
+  }
+
+  def dropHistory(prjName:String, tagName:String,srcPath:String, destPath:String, historyPath:String): Unit ={
+    val inDF = sc.textFile(srcPath).map(row => (row.split("\t")(0),row.split("\t")(1))).
+      toDF("mobile","tmpTag")
+
+    val tagStrigSuf = prjName match{
+      case "daoxila" => ":96928575"
+      case "futures" => ":96928579"
+      case _ => ""
+    }
+    val tagString = ":" + tagName + "_" + today + tagStrigSuf
+
+    val subIndex = if (prjName == "daoxila") 5 else 4
+
+    val antiJoin = if (fs.exists(new Path(historyPath))) {
+      val historyDF = sc.textFile("%s/*".format(historyPath)).map(row => row.split("\t")(0)).
+        toDF("mobile")
+      inDF.join(historyDF,Seq("mobile"),"leftanti")
+    } else inDF
+
+    val tagDF = antiJoin.withColumn("tag", concat(substring($"tmpTag",0,subIndex),lit(tagString))).
+      drop("tmpTag").
+      dropDuplicates(Seq("mobile"))
+
+    tagDF.show(false)
+    tagDF.coalesce(1).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
+
+
+  }
+
+  def kvMatch(srcPath:String, tagName:String, destPath:String): Unit ={
+    val inDF = sc.textFile(srcPath).map({ row =>
+      val arr = row.split("\t")
+      (arr(0), arr(1))
+    })
+
+    val kvDF = inDF.zipWithIndex().map({
+      row =>
+        (tagName + "_" + today + "_" + row._2, "ad" + "\t" + row._1._2 + "\t" + row._1._1)
+    }).toDF("key", "value")
+
+    //val dataAcount = Seq((tagName + "_" + today + "_total", inDF.count)).toDF("key","value")
+
+    //val kvDF = inDF.union(dataAcount)
+    print(inDF.count())
+    kvDF.show(false)
+
+    kvDF.coalesce(1).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
+
+
+  }
+
+  // save mobile (method dropHistory ) to history
+  def historyTbl(srcPath:String, savePath:String): Unit ={
+    val mobileDF = sc.textFile(srcPath).map(row => row.split("\t")(0)).toDF("mobile")
+
+    mobileDF.coalesce(1).write.format("com.databricks.spark.csv").
+      option("delimiter","\t").save(savePath)
+  }
+
+  def cdr(prjName:String, tagName:String): Unit = {
+    // prjname: daoxila , qijia, futures
+    // tagName: DXL_22_01, DLX_23_02, QJW_ZT1_01, si_t_1 etc.
+
+    val inOrOutString = inOrOut(prjName,tagName.split("_")(1))
+
+    // set path
+
+    // history path
+    val historyDir = s"hdfs://ns1/user/u_tel_hlwb_xgq/private/lxc_xgq/${prjName}_final_history"
+    val saveHistoryDir = s"${historyDir}/${prjName}_cdr_${inOrOutString}_${today}"
+
+    // normal path
+    val localDir:String = "/data/u_tel_hlwb_xgq/cdrdata"
+    val hadoopDir:String = s"hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/${prjName}/${today}"
+
+    var localPath = "%s/%s_%s_%s".format(localDir,prjName,inOrOutString,today)
+    var hadoopPath = "%s/%s_%s_%s".format(hadoopDir,prjName,inOrOutString,today)
+    // if file name is not empty, then put the file up instead of default
+
+
+    val dropHistoryPath = s"${hadoopDir}/${prjName}_drop_history_${inOrOutString}_${today}"
+    val kvPath = s"${hadoopDir}/${prjName}_kv_${inOrOutString}_${today}"
+
+    // deleting files
+    //deleteFile(hadoopPath)
+    deleteFile(dropHistoryPath)
+    deleteFile(kvPath)
+    deleteFile(saveHistoryDir)
+
+
+    // run stages
+    //fromLocalToHadoop(localPath, hadoopPath)
+    dropHistory(prjName, tagName,hadoopPath,dropHistoryPath,historyDir)
+    kvMatch(dropHistoryPath,tagName,kvPath)
+    historyTbl(dropHistoryPath,saveHistoryDir)
   }
 }
 
