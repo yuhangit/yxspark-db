@@ -9,7 +9,11 @@ import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.{concat, lit, split}
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.sql.catalyst.expressions.Base64
 
+
+case class SadaRecord(scrip:String, ad:String, ts:Long, url:String, ref:String, ua:String, dstip:String,cookie:String,
+                      srcPort:String)
 object YXSpark {
   val sdf: SimpleDateFormat = new SimpleDateFormat("yyyyMMdd")
   val hdfspath: String = "hdfs://ns1/user/" + System.getProperty("user.name") + "/private/"
@@ -67,7 +71,7 @@ object YXSpark {
     val configfile = lclient + ".config"
 
     val configpath = if (mode == "cluster") hdfsconfpath
-      else if (mode == "client")  ""
+    else if (mode == "client")  ""
 
     val configm :Map[String, String] =
       if (mode == "cluster") {
@@ -122,26 +126,29 @@ object YXSpark {
   }
 
   def getfiles(filename: String) : List[String] = {
-      val fs = FileSystem.get(new java.net.URI(hdfsconfpath),new Configuration())
-      val files = fs.listStatus(new Path(hdfsconfpath))
-      val ds = fs.getFileStatus(new Path(hdfsconfpath))
-      if(ds.isDirectory()){
-        files.filter(n=>n.isFile && n.getPath.toString.contains(filename)).map({n=>n.getPath.toString}).toList
-      }else{
-        List[String]()
-      }
+    val fs = FileSystem.get(new java.net.URI(hdfsconfpath),new Configuration())
+    val files = fs.listStatus(new Path(hdfsconfpath))
+    val ds = fs.getFileStatus(new Path(hdfsconfpath))
+    if(ds.isDirectory()){
+      files.filter(n=>n.isFile && n.getPath.toString.contains(filename)).map({n=>n.getPath.toString}).toList
+    }else{
+      List[String]()
+    }
 
-      //    val d = new File(".")
-      //    if (d.exists && d.isDirectory) {
-      //      d.listFiles.filter(n => n.isFile && n.getName.contains(filename))
-      //        .map(n => n.getName).toList
-      //    } else {
-      //      List[String]()
-      //    }
+    //    val d = new File(".")
+    //    if (d.exists && d.isDirectory) {
+    //      d.listFiles.filter(n => n.isFile && n.getName.contains(filename))
+    //        .map(n => n.getName).toList
+    //    } else {
+    //      List[String]()
+    //    }
   }
 
   def stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String): Unit = {
     println("Running stg_s0")
+
+
+    val sadaRecordArr = Array("scrip", "ad", "ts", "url", "ref", "ua", "dstip","cookie", "srcPort")
 
     sources.foreach({l =>
       println("Searching " + varsmap(l(1)))
@@ -156,8 +163,18 @@ object YXSpark {
 
       println("Total search keywords: " + allkeywords.length)
 
-      val tbl = sc.textFile(varsmap(l(1)))
-        .filter(line => allkeywords.exists(k => k.forall(line.contains(_)))).toDF
+      val tbl = sc.textFile(varsmap(l(1))).map{
+        line =>
+          val arr:Array[String] = line.split("\t")
+          val ref = if (arr(4).toLowerCase == "nodef") "" else arr(4)
+          val ua = if ( arr(5).toLowerCase  == "nodef") "" else arr(5)
+          val cookie = if (arr(7).toLowerCase == "nodef") "" else arr(7)
+          (arr(0),arr(1),arr(2),arr(3),ref,ua,arr(6),cookie,arr(8))
+      }.toDF(sadaRecordArr:_*).
+        withColumn("ref", decode(unbase64($"ref"),"UTF-8")).
+        withColumn("ua",decode(unbase64($"ua"),"UTF-8")).
+        withColumn("cookie",decode(unbase64($"cookie"),"UTF-8"))
+
 
       tbl.coalesce(1000).write.format("com.databricks.spark.csv")
         .option("delimiter", varsmap("output_dlm"))
@@ -523,7 +540,18 @@ object YXSpark {
     df.coalesce(10).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
   }
 
-  def kvMatch(srcPath:String, tagName:String, destPath:String) {
+  def filterCdr(srcPath:String,configPath:String,filterPath:String, remainPath:String): Unit ={
+    val tagFile = sc.textFile(configPath).map(row => row.split(" ")).collect().toList
+    val srcDF = sc.textFile(srcPath)
+
+    val filterDF = srcDF.filter(row => tagFile.exists((l:Array[String]) => row.contains(l(0))))
+    val remainDF = srcDF.filter(row => !tagFile.exists((l:Array[String]) => row.contains(l(0))))
+
+    filterDF.saveAsTextFile(filterPath)
+    remainDF.saveAsTextFile(remainPath)
+  }
+
+  def kvMatch(srcPath:String, tagName:String,  destPath:String) {
     val inDF = sc.textFile(srcPath).collect()
 
     //inDF.toDF().show()
@@ -531,12 +559,19 @@ object YXSpark {
 
     val kvDF = inDF.zipWithIndex.map({row =>
       val arr = row._1.toString.split("\t")
+      val batchid = if (tagName.contains("DXL_15")) {
+        val i = arr(1).split(":")
+        i(1) = tagName+"_"+today
+        i.mkString(":")
+      }else arr(1)
 
-      (tagName + "_" + today + "_" + row._2, "ad" + "\t" + arr(1) + "\t" + arr(0))
-    }).:+(tagName + "_total", inDF.size.toString)
+      (tagName + "_" + today + "_" + row._2, "ad" + "\t" + batchid + "\t" + arr(0))
+
+    }).:+(tagName+"_" + today +"_total", inDF.size.toString)
+
 
     //kvDF.show
-    val df = sc.parallelize(kvDF.toSeq).toDF()
+    sc.parallelize(kvDF.toSeq).toDF()
       .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
   }
 
@@ -561,16 +596,20 @@ object YXSpark {
     val saveHistoryDir = historyDir + "/" + prjName + "_cdr_" + inOrOutString + "_" + sdate
 
     // normal path
+    val configPath = "hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/config/daoxila_cdr_tag.txt"
+
 
     val hadoopDir = "hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/" + prjName + "/" + sdate
 
 
     val hadoopPath = hadoopDir + "/" + prjName + "_" + inOrOutString + "_" + sdate
     // if file name is not empty, then put the file up instead of default
-
-
+    val filterPath = hadoopDir + "/" + prjName + "_" + inOrOutString + "_filter_" + sdate
+    val remainPath = hadoopDir + "/" + prjName + "_" + inOrOutString + "_remain_" + sdate
     val dropHistoryPath = hadoopDir + "/" + prjName + "_drop_history_" + inOrOutString + "_" + sdate
     val kvPath = hadoopDir + "/" + prjName + "_kv_" + inOrOutString + "_" + sdate
+    val remainKvPath = hadoopDir + "/" + prjName + "_remain_kv_" + inOrOutString + "_" + sdate
+    val filterKvPath = hadoopDir + "/" + prjName + "_filter_kv_" + inOrOutString + "_" + sdate
 
     // deleting files
     //deleteFile(hadoopPath)
@@ -582,7 +621,21 @@ object YXSpark {
     // run stages
     //fromLocalToHadoop(localPath, hadoopPath)
     dropHistory(prjName, tagName,hadoopPath,dropHistoryPath,historyDir)
-    kvMatch(dropHistoryPath,tagName,kvPath)
+
+    if (prjName == "daoxila"){
+      filterCdr(dropHistoryPath,configPath,filterPath,remainPath)
+      kvMatch(remainPath,tagName,remainKvPath)
+
+      if (inOrOutString == "call_in")
+        kvMatch(filterPath,"DXL_15_03",filterKvPath)
+      else
+        kvMatch(filterPath,"DXL_15_04",filterKvPath)
+
+    }else{
+      kvMatch(dropHistoryPath,tagName,kvPath)
+
+    }
     historyTbl(dropHistoryPath,saveHistoryDir)
+
   }
 }
