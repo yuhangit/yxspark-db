@@ -6,13 +6,13 @@ import java.util.Date
 import org.apache.hadoop.conf._
 import org.apache.spark.sql.functions._
 import org.apache.spark.SparkContext
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions.{concat, lit, split}
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.catalyst.expressions.Base64
 
 
-case class SadaRecord(scrip:String, ad:String, ts:Long, url:String, ref:String, ua:String, dstip:String,cookie:String,
+case class SadaRecord(scrip:String, ad:String, ts:String, url:String, ref:String, ua:String, dstip:String,cookie:String,
                       srcPort:String)
 object YXSpark {
   val sdf: SimpleDateFormat = new SimpleDateFormat("yyyyMMdd")
@@ -144,9 +144,20 @@ object YXSpark {
     //    }
   }
 
-  def stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String): Unit = {
+  /**
+    *
+    * @param varsmap
+    * @param sources
+    * @param client
+    * @param sdate
+    * @param searchPattern: url match pattern, only with url filed ("url") or with url and ref ("full"  -- now word other than ulr is ok)
+    * @param savePattern: save pattern, only save ad,ua, first 50 characters of url ("simple"), or all fields ("full" -- now work other than full is ok)
+    */
+  def stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, searchPattern:String , savePattern:String ): Unit = {
     println("Running stg_s0")
 
+    //assert(searchPattern == "full" || searchPattern == "url")
+    //assert(savePattern == "full" || searchPattern == "simple")
 
     val sadaRecordArr = Array("scrip", "ad", "ts", "url", "ref", "ua", "dstip","cookie", "srcPort")
 
@@ -163,7 +174,7 @@ object YXSpark {
 
       println("Total search keywords: " + allkeywords.length)
 
-      val tbl = sc.textFile(varsmap(l(1))).map{
+      val sourceTbl = sc.textFile(varsmap(l(1))).map{
         line =>
           val arr:Array[String] = line.split("\t")
           val ref = if (arr(4).toLowerCase == "nodef") "" else arr(4)
@@ -171,9 +182,26 @@ object YXSpark {
           val cookie = if (arr(7).toLowerCase == "nodef") "" else arr(7)
           (arr(0),arr(1),arr(2),arr(3),ref,ua,arr(6),cookie,arr(8))
       }.toDF(sadaRecordArr:_*).
-        withColumn("ref", decode(unbase64($"ref"),"UTF-8")).
-        withColumn("ua",decode(unbase64($"ua"),"UTF-8")).
-        withColumn("cookie",decode(unbase64($"cookie"),"UTF-8"))
+        withColumn("url", regexp_replace($"url","\t","")).
+        withColumn("ref",regexp_replace(decode(unbase64($"ref"),"UTF-8"),"\t","")).
+        //withColumn("ua",decode(unbase64($"ua"),"UTF-8")).
+        withColumn("cookie",decode(unbase64($"cookie"),"UTF-8")).as[SadaRecord]
+
+      val tbl  =
+        if (searchPattern == "url" ){
+          val saveTbl = sourceTbl.filter{
+              record =>
+                allkeywords.exists(l => l.forall(record.url.contains(_)))
+            }.toDF(sadaRecordArr:_*)
+          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50))
+
+        }else {
+          val saveTbl = sourceTbl.filter{
+            record =>
+              allkeywords.exists(l => l.forall(record.url.contains(_) )|| l.forall(record.ref.contains(_)) )
+          }.toDF(sadaRecordArr:_*)
+          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50),substring($"cookie",0,50))
+        }
 
 
       tbl.coalesce(1000).write.format("com.databricks.spark.csv")
@@ -485,7 +513,7 @@ object YXSpark {
     val sources = getsources(client)
 
     prog match {
-      case "stg_s0" => stg_s0(varsmap, sources, client, sdate)
+      case "stg_s0" => stg_s0(varsmap, sources, client, sdate, args.lift(3).getOrElse("url"), args.lift(4).getOrElse("full"))
       case "stg_s1" => stg_s1(varsmap, sources, client, sdate)
       case "stg_s1_with_stg_s0" => stg_s1(varsmap, sources, client, sdate, "_s0")
       case "stg_s2" => stg_s2(varsmap, sources, client, sdate)
