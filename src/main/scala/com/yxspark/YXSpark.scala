@@ -281,10 +281,13 @@ object YXSpark {
         val arr = r.split(ldlm)
         (arr(0), arr(1), arr(2))
       })
+      val counts = (inputtbl.count()/10000).toInt
+      val pieces = inputtbl.randomSplit(Array.fill(counts)(1))
+      var outputtbl = phone.phone_match(spark,pieces(0),af.toString)
+      for (piece <- pieces.drop(1))
+        outputtbl = outputtbl.union(phone.phone_match(spark, inputtbl, af.toString))
 
-      val outputtbl = phone.phone_match(spark, inputtbl, af.toString)
-
-      outputtbl.coalesce(10).write.format("com.databricks.spark.csv")
+      outputtbl.write.format("com.databricks.spark.csv")
         .option("delimiter", ldlm).save(ht)
     } else if (mode == "client") {
       import sys.process._
