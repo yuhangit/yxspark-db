@@ -1,7 +1,7 @@
 package com.yxspark
 
 import java.text.SimpleDateFormat
-import java.util.Date
+import java.util.{Calendar, Date}
 
 import org.apache.hadoop.conf._
 import org.apache.spark.sql.functions._
@@ -9,14 +9,17 @@ import org.apache.spark.SparkContext
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions.{concat, lit, split}
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.catalyst.expressions.Base64
-
+import org.codehaus.jackson.map.ext.CoreXMLDeserializers.GregorianCalendarDeserializer
+import java.util.GregorianCalendar
 
 case class SadaRecord(scrip:String, ad:String, ts:String, url:String, ref:String, ua:String, dstip:String,cookie:String,
                       srcPort:String)
 object YXSpark {
   val sdf: SimpleDateFormat = new SimpleDateFormat("yyyyMMdd")
-  val hdfspath: String = "hdfs://ns1/user/" + System.getProperty("user.name") + "/private/"
+  // change hdfspath to private/db/ for test
+  val hdfspath: String = "hdfs://ns1/user/" + System.getProperty("user.name") + "/private/db/"
   val hdfsconfpath: String = hdfspath + "all/config/"
   val today: String = sdf.format(new Date())
 
@@ -26,14 +29,16 @@ object YXSpark {
   import spark.sqlContext.implicits._
   val mode: String = sc.getConf.get("spark.submit.deployMode")
 
+  val hadoopConf = new org.apache.hadoop.conf.Configuration()
+  val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+
+  val sadaRecordArr = Array("scrip", "ad", "ts", "url", "ref", "ua", "dstip","cookie", "srcPort")
   def escape(raw: String): String = {
     import scala.reflect.runtime.universe._
     Literal(Constant(raw)).toString().replace("\"", "")
   }
 
   def tblexists(tbl: String): Boolean = {
-    val hadoopConf = new org.apache.hadoop.conf.Configuration()
-    val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
     fs.exists(new org.apache.hadoop.fs.Path(tbl))
   }
 
@@ -155,11 +160,12 @@ object YXSpark {
     */
   def stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, searchPattern:String , savePattern:String ): Unit = {
     println("Running stg_s0")
-
+//    val calendar = Calendar.getInstance()
+//    calendar.add(Calendar.DATE, -1)
+//    val yesterday = new SimpleDateFormat("yyyy-MM-dd").format(calendar.getTime)
+    val sdateFormat = new SimpleDateFormat("yyyy-MM-dd").format(new SimpleDateFormat("yyyyMMdd").parse(sdate))
     //assert(searchPattern == "full" || searchPattern == "url")
     //assert(savePattern == "full" || searchPattern == "simple")
-
-    val sadaRecordArr = Array("scrip", "ad", "ts", "url", "ref", "ua", "dstip","cookie", "srcPort")
 
     sources.foreach({l =>
       println("Searching " + varsmap(l(1)))
@@ -169,11 +175,26 @@ object YXSpark {
         .map({f =>
           println("Reading search keywords in " + f)
           //          scala.io.Source.fromFile(f).getLines.map(k => k.split(" +")).toList
-          sc.textFile(f).map(l=>l.split(" +")).collect().toList
+
+          // add source file to it
+          sc.textFile(f).map(l=> l.split(" +") ++ Array(new Path(f).getName.split("\\.").dropRight(1).mkString("."))).collect().toList
         }).flatten
 
       println("Total search keywords: " + allkeywords.length)
 
+      // get source tag, normal prior than pv.
+      val addSource = udf{(url:String, ref:String) =>
+        val keywords = allkeywords.filter(l => l.dropRight(1).forall(url.contains(_)) || l.dropRight(1).forall(ref.contains(_))).
+          map(arr => arr.last).distinct
+
+        keywords.mkString(",")
+        //val firstKey = keywords.sorted.head  // for the case of dropWhile drop all elements
+        //if  (keywords.size == 1) firstKey else keywords.dropWhile(e => e.contains("pv")).headOption.getOrElse(firstKey)
+      }
+      val toString = udf{binaryArray:Array[Byte] =>
+        new String(binaryArray)
+      }
+      // should unbase in postgresql
       val sourceTbl = sc.textFile(varsmap(l(1))).map{
         line =>
           val arr:Array[String] = line.split("\t")
@@ -182,25 +203,31 @@ object YXSpark {
           val cookie = if (arr(7).toLowerCase == "nodef") "" else arr(7)
           (arr(0),arr(1),arr(2),arr(3),ref,ua,arr(6),cookie,arr(8))
       }.toDF(sadaRecordArr:_*).
-        withColumn("url", regexp_replace($"url","\t","")).
-        withColumn("ref",regexp_replace(decode(unbase64($"ref"),"UTF-8"),"\t","")).
-        //withColumn("ua",decode(unbase64($"ua"),"UTF-8")).
-        withColumn("cookie",decode(unbase64($"cookie"),"UTF-8")).as[SadaRecord]
+      withColumn("url", regexp_replace($"url","\\p{C}|\\\\.","?")).
+      withColumn("ref",regexp_replace(decode(unbase64($"ref"),"UTF-8"),"\\p{C}|\\\\.","?"))
+      //withColumn("ua",decode(unbase64($"ua"),"UTF-8")).
+      .withColumn("cookie",regexp_replace(decode(unbase64($"cookie"),"UTF-8"),"\\p{C}|\\\\.","?"))
+      //.withColumn("cookie",toString(unbase64($"cookie")))
+      .as[SadaRecord]
+
 
       val tbl  =
         if (searchPattern == "url" ){
           val saveTbl = sourceTbl.filter{
               record =>
-                allkeywords.exists(l => l.forall(record.url.contains(_)))
+                // caution: exclude last element i.e. src tag
+                allkeywords.exists(l => l.dropRight(1).forall(record.url.contains(_)))
             }.toDF(sadaRecordArr:_*)
-          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50))
+            .withColumn("src", addSource($"url",lit(""))).withColumn("dt",lit(sdateFormat)).withColumn("category",lit(l(1))) // add meta information
+          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50),$"src",$"dt")
 
         }else {
           val saveTbl = sourceTbl.filter{
             record =>
-              allkeywords.exists(l => l.forall(record.url.contains(_) )|| l.forall(record.ref.contains(_)) )
+              allkeywords.exists(l => l.dropRight(1).forall(record.url.contains(_) )|| l.dropRight(1).forall(record.ref.contains(_)) )
           }.toDF(sadaRecordArr:_*)
-          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50),substring($"cookie",0,50))
+            .withColumn("src",addSource($"url",$"ref")).withColumn("dt", lit(sdateFormat)).withColumn("category",lit(l(1))) // add meta information
+          if (savePattern == "full") saveTbl else saveTbl.select($"ad",$"ua",substring($"url",0,50),substring($"cookie",0,50),$"src",$"dt")
         }
 
 
@@ -268,46 +295,12 @@ object YXSpark {
     showcounts(varsmap("stg_s2"))
   }
 
-  def stg_s3(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, af: Int) {
-    println("Running stg_s3")
-
-    val ht :String = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1" else ""
+  def stg_s3_comb(varsmap:Map[String,String],af:Int): Unit ={
     val ldlm = varsmap("output_dlm")
+    val ht = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1" else ""
 
-    if (mode == "cluster") {
-      import hlwbbigdata.phone
-
-      val inputtbl = sc.textFile(varsmap("stg_s2")).map({r =>
-        val arr = r.split(ldlm)
-        (arr(0), arr(1), arr(2))
-      })
-      val counts = (inputtbl.count()/10000).toInt
-      val pieces = inputtbl.randomSplit(Array.fill(counts)(1))
-      var outputtbl = phone.phone_match(spark,pieces(0),af.toString)
-      for (piece <- pieces.drop(1))
-        outputtbl = outputtbl.union(phone.phone_match(spark, inputtbl, af.toString))
-
-      outputtbl.write.format("com.databricks.spark.csv")
-        .option("delimiter", ldlm).save(ht)
-    } else if (mode == "client") {
-      import sys.process._
-
-      val shell = if (varsmap("output_dlm") == "\t") "spark-submit-hlwbbigdata-tab.sh" else ""
-
-      val cmd = "./" + shell + " " + varsmap("stg_s2") + " " + ht + " " + af
-
-      println("Running" + cmd)
-      val ret = cmd.!
-
-      println("Process finished with exit code " + ret)
-
-      if (ret != 0) {
-        println("Shell job returned error code, job aborted")
-        System.exit(1)
-      }
-    }
-
-    showcounts(ht.toString)
+    val df = sc.textFile(ht+ "_*")
+    df.saveAsTextFile(ht)
 
     if (af == 1) {
       val stg_acc_s3 = sc.textFile(varsmap("stg_acc_s3")).toDF
@@ -332,6 +325,55 @@ object YXSpark {
     }
   }
 
+  def stg_s3(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, af: Int, pieceAmount:Int = 10000) {
+    println("Running stg_s3")
+
+    val ht :String = if(af == 0) varsmap("stg_acc_s3") else if (af == 1) varsmap("stg_fuz_s3") + "_s1" else ""
+    val ldlm = varsmap("output_dlm")
+
+    if (mode == "cluster") {
+      import hlwbbigdata.phone
+
+      val inputtbl = sc.textFile(varsmap("stg_s2")).map({r =>
+        val arr = r.split(ldlm)
+        (arr(0), arr(1), arr(2))
+      })
+      val counts = (inputtbl.count()/pieceAmount).toInt
+      val pieces = inputtbl.randomSplit(Array.fill(counts)(1))
+//      var outputtbl = phone.phone_match(spark,pieces(0),af.toString)
+//      for (piece <- pieces.drop(1))
+//        outputtbl = outputtbl.union(phone.phone_match(spark, inputtbl, af.toString))
+
+      pieces.zipWithIndex.foreach{
+        rddPair =>
+        val piece = phone.phone_match(spark, rddPair._1, af.toString)
+        piece.write.format("com.databricks.spark.csv").option("delimiter","\t").
+          save(ht+ "_" + rddPair._2)
+
+      }
+
+    } else if (mode == "client") {
+      import sys.process._
+
+      val shell = if (varsmap("output_dlm") == "\t") "spark-submit-hlwbbigdata-tab.sh" else ""
+
+      val cmd = "./" + shell + " " + varsmap("stg_s2") + " " + ht + " " + af
+
+      println("Running" + cmd)
+      val ret = cmd.!
+
+      println("Process finished with exit code " + ret)
+
+      if (ret != 0) {
+        println("Shell job returned error code, job aborted")
+        System.exit(1)
+      }
+    }
+
+    showcounts(ht.toString)
+
+  }
+
   def final_tbl(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String) {
     val ltagdlm = varsmap("tag_dlm")
 
@@ -348,17 +390,24 @@ object YXSpark {
         .drop($"_stmp")
     })
 
-    val history_tbl = sc.textFile(varsmap("history_tbl")).toDF
-      .withColumn("_tmp", split($"value", varsmap("output_dlm")))
-      .select(
-        $"_tmp".getItem(0).as("id")
-      ).drop($"_tmp")
+//    val history_tbl = sc.textFile(varsmap("history_tbl")).toDF
+//      .withColumn("_tmp", split($"value", varsmap("output_dlm")))
+//      .select(
+//        $"_tmp".getItem(0).as("id")
+//      ).drop($"_tmp")
     //    val tagl = scala.io.Source.fromFile(varsmap("tag_file")).getLines.map(l => l.split(" +")).toList
     val tagl = sc.textFile(varsmap("tag_file")).map(l=>l.split(" +")).collect().toList
     //al.foreach(l => println(l.mkString(",")))
 
-    val tbl = data.reduce(_ union _)
-      .join(history_tbl, Seq("id"), "leftanti")
+    // judgement if history directory exists.
+    val dropTbl = if (fs.exists(new Path(varsmap("history_tbl").dropRight(2))))
+      data.reduce(_ union _).
+        join(sc.textFile(varsmap("history_tbl")).map(row => row.split(varsmap("output_dlm"))(0)).toDF("id"), Seq("id"), "leftanti")
+    else data.reduce(_ union _)
+
+
+
+    val tbl = dropTbl
       .map({r =>
         val tag = tagl.filter({x =>
           val tags = x(0).replace(ltagdlm, " ").split(" +").toList
@@ -428,7 +477,7 @@ object YXSpark {
       }).union(sc.parallelize(Seq((key + "_total", r._1.get(1).toString))))
         .toDF()
 
-      tbl.coalesce(10).write.format("com.databricks.spark.csv")
+      tbl.coalesce(1).write.format("com.databricks.spark.csv")
         .option("delimiter", varsmap("output_dlm")).save(varsmap("kv_tbl") + "_" + key)
 
       showcounts(varsmap("kv_tbl") + "_" + key)
@@ -492,8 +541,8 @@ object YXSpark {
   def run_all(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag:String, batch: Int) {
     stg_s1(varsmap, sources, client, sdate)
     stg_s2(varsmap, sources, client, sdate)
-    stg_s3(varsmap, sources, client, sdate, 0)
-    stg_s3(varsmap, sources, client, sdate, 1)
+    stg_s3(varsmap, sources, client, sdate, 0);stg_s3_comb(varsmap,0)
+    stg_s3(varsmap, sources, client, sdate, 1);stg_s3_comb(varsmap,1)
     final_tbl(varsmap, sources, client, sdate)
     kv_tbl(varsmap, sources, client, sdate, tag, batch)
   }
@@ -501,8 +550,8 @@ object YXSpark {
   def run_all_with_stg_s0(varsmap: Map[String, String], sources: List[List[String]], client: String, sdate: String, tag:String, batch: Int) {
     stg_s1(varsmap, sources, client, sdate, "_s0")
     stg_s2(varsmap, sources, client, sdate)
-    stg_s3(varsmap, sources, client, sdate, 0)
-    stg_s3(varsmap, sources, client, sdate, 1)
+    stg_s3(varsmap, sources, client, sdate, 0);stg_s3_comb(varsmap,0)
+    stg_s3(varsmap, sources, client, sdate, 1);stg_s3_comb(varsmap,1)
     final_tbl(varsmap, sources, client, sdate)
     kv_tbl(varsmap, sources, client, sdate, tag, batch)
   }
@@ -511,6 +560,7 @@ object YXSpark {
     val prog = args(0)
     val client = if (prog == "stg_s0" || prog == "kv_enc_tbl_with_stg_s0") "all" else args(1)
     val sdate = args(2)
+    val pieceAmount = args.lift(3).getOrElse("10000")
 
     val varsmap = getvars(client, sdate)
     val sources = getsources(client)
@@ -520,8 +570,8 @@ object YXSpark {
       case "stg_s1" => stg_s1(varsmap, sources, client, sdate)
       case "stg_s1_with_stg_s0" => stg_s1(varsmap, sources, client, sdate, "_s0")
       case "stg_s2" => stg_s2(varsmap, sources, client, sdate)
-      case "stg_s3_acc" => stg_s3(varsmap, sources, client, sdate, 0)
-      case "stg_s3_fuz" => stg_s3(varsmap, sources, client, sdate, 1)
+      case "stg_s3_acc" => stg_s3(varsmap, sources, client, sdate, 0,pieceAmount.toInt);stg_s3_comb(varsmap,0)
+      case "stg_s3_fuz" => stg_s3(varsmap, sources, client, sdate, 1,pieceAmount.toInt);stg_s3_comb(varsmap,1)
       case "final_tbl" => final_tbl(varsmap, sources, client, sdate)
       case "kv_tbl" => kv_tbl(varsmap, sources, client, sdate, args(3), args(4).toInt)
       case "history_tbl" => history_tbl(varsmap, sources, client, sdate, args(3))
@@ -540,8 +590,15 @@ object YXSpark {
     val map = (prjName,batchId) match {
       case ("daoxila","22") => "call_in"
       case ("daoxila","23") => "call_out"
-      case("qijia","ZT1") => "call_in"
+      case ("qijia","ZT1") => "call_in"
       case ("qijia","ZT2") => "call_out"
+      case ("dk","ZT1") => "call_in"
+      case ("dk","ZT2") => "call_out"
+      case ("yypx","ZT1") => "call_in"
+      case ("yypx","ZT2") => "call_out"
+      case ("cfapx","ZT1") => "call_in"
+      case ("cfapx","ZT2") => "call_out"
+
     }
     map
   }
@@ -603,7 +660,7 @@ object YXSpark {
 
     //kvDF.show
     sc.parallelize(kvDF.toSeq).toDF()
-      .coalesce(10).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
+      .coalesce(1).write.format("com.databricks.spark.csv").option("delimiter","\t").save(destPath)
   }
 
   // save mobile (method dropHistory ) to history
@@ -627,7 +684,7 @@ object YXSpark {
     val saveHistoryDir = historyDir + "/" + prjName + "_cdr_" + inOrOutString + "_" + sdate
 
     // normal path
-    val configPath = "hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/config/daoxila_cdr_tag.txt"
+    val configPath = s"hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/config/${prjName}_cdr_tag.txt"
 
 
     val hadoopDir = "hdfs://ns1/user/u_tel_hlwb_xgq/private/cdr/" + prjName + "/" + sdate
